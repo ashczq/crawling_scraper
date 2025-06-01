@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import random
 import time
 from pathlib import Path
@@ -17,23 +18,24 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
 
+def _configure_logging(level: str = "INFO") -> None:
+    """Configure root logger with timestamp + level."""
+    logging.basicConfig(
+        format="%(asctime)s  %(levelname)-8s %(message)s",
+        datefmt="%H:%M:%S",
+        level=getattr(logging, level.upper(), logging.INFO),
+    )
 
-#helper function
+
+logger = logging.getLogger(__name__)
+
 def _make_soup(html: str) -> BeautifulSoup:
-    """Return a BeautifulSoup object, preferring ``lxml`` but falling back
-    to Python’s built-in ``html.parser`` if *lxml* is not installed.
-
-    Args:
-        html: Raw HTML text.
-
-    Returns:
-        A BeautifulSoup DOM tree.
-    """
+    """Parse *html* preferring lxml, falling back to html.parser."""
     try:
         return BeautifulSoup(html, "lxml")
     except (FeatureNotFound, ImportError):
+        logger.warning("lxml parser missing – falling back to html.parser")
         return BeautifulSoup(html, "html.parser")
-
 
 class QuoteScrollScraper:
     """Scraper for the quotes.toscrape.com *infinite-scroll* demo page.
@@ -52,13 +54,12 @@ class QuoteScrollScraper:
     headless:
         Run Chrome in headless mode.  Has no effect in static mode.
     scroll_pause:
-        Seconds to wait after each ``window.scrollTo`` call so the backend
+        Seconds to wait after each `window.scrollTo call so the backend
         can deliver the next batch of quotes.
     max_scrolls:
         Safety cap on the number of scroll attempts; prevents endless loops
         on network errors or unexpected markup changes.
     """
-
     DEFAULT_URL = "https://quotes.toscrape.com/scroll"
 
     def __init__(
@@ -79,65 +80,48 @@ class QuoteScrollScraper:
         self.max_scrolls = max_scrolls
 
     def scrape(self) -> pd.DataFrame:
-        """Return a ``pandas.DataFrame`` containing the requested number of
-        quotes.
+        """Return a DataFrame with at least *min_quotes* rows."""
+        mode = "dynamic" if self.dynamic else "static"
+        logger.info("Scraping start | mode=%s  target_rows=%d", mode, self.min_quotes)
 
-        Returns
-        -------
-        pandas.DataFrame
-            Columns: *text*, *author*, *tags*.
-        """
         quotes = (
             self._scrape_dynamic()
             if self.dynamic
             else self._scrape_static(limit=self.min_quotes)
         )
-        return pd.DataFrame(quotes)
+
+        df = pd.DataFrame(quotes)
+        logger.info("Scraping done  | rows=%d", len(df))
+        return df
 
     def save(self, df: pd.DataFrame, outfile: Path | str) -> None:
-        """Write the DataFrame to disk as UTF-8 CSV (with BOM) or JSON.
-
-        Args:
-            df: The data returned by :py:meth:`scrape`.
-            outfile: Path whose extension determines the format.
-                     ``.csv`` → CSV;  ``.json`` → JSON.
-        """
+        """Persist DataFrame as CSV-BOM or JSON."""
         path = Path(outfile).expanduser()
         if path.suffix.lower() == ".json":
             df.to_json(path, orient="records", indent=2, force_ascii=False)
         else:
-            df.to_csv(path, index=False, encoding="utf-8-sig") 
-        print(f"Saved {len(df):,} rows → {path.resolve()}")
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+
+        logger.info("Saved %d rows → %s", len(df), path.resolve())
 
     def _scrape_static(self, limit: int) -> List[dict]:
-        """Grab the first *limit* quotes from the server-rendered HTML.
-
-        The site only ships 10 quotes statically; requesting more forces
-        callers into dynamic mode.
-
-        Raises
-        ------
-        RuntimeError
-            If *limit* is > 10.
-        """
+        """Grab the first *limit* quotes from the homepage (no JS)."""
         if limit > 10:
-            raise RuntimeError(
-                "Static mode can only capture the first 10 quotes. "
-                "Run with --dynamic for a full scrape."
-            )
+            raise RuntimeError("Static mode limited to 10 rows; use --dynamic.")
 
-        resp = requests.get(self.url, timeout=10)
-        resp.encoding = "utf-8"  
+        homepage = "https://quotes.toscrape.com"
+        resp = requests.get(homepage, timeout=10)
+        resp.encoding = "utf-8"
         soup = _make_soup(resp.text)
 
-        return [
+        quotes = [
             self._parse_quote_div(div) for div in soup.select("div.quote")
         ][:limit]
+        logger.debug("Static scrape collected %d rows", len(quotes))
+        return quotes
 
     def _scrape_dynamic(self) -> List[dict]:
-        """Open the page in headless Chrome and keep scrolling until at
-        least *min_quotes* unique quotes are gathered or *max_scrolls*
-        attempts have been made."""
+        """Scroll headless Chrome until *min_quotes* unique quotes collected."""
         opts = Options()
         if self.headless:
             opts.add_argument("--headless=new")
@@ -149,23 +133,29 @@ class QuoteScrollScraper:
         driver = webdriver.Chrome(service=service, options=opts)
 
         quotes: Dict[str, dict] = {}
+        scroll_count = 0
+        last_announce = time.time()
+
         try:
             driver.get(self.url)
-
             WebDriverWait(driver, 6).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div.quote"))
             )
-
             last_height = driver.execute_script("return document.body.scrollHeight")
 
-            for _ in range(self.max_scrolls):
+            for scroll_count in range(1, self.max_scrolls + 1):
                 soup = _make_soup(driver.page_source)
                 for div in soup.select("div.quote"):
                     q = self._parse_quote_div(div)
-                    quotes[q["text"]] = q  
+                    quotes[q["text"]] = q
 
                 if len(quotes) >= self.min_quotes:
                     break
+
+                # periodic debug output
+                if time.time() - last_announce > 1.0:
+                    logger.debug("scroll=%d  rows=%d", scroll_count, len(quotes))
+                    last_announce = time.time()
 
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
                 time.sleep(self.scroll_pause + random.uniform(0.1, 0.3))
@@ -178,36 +168,35 @@ class QuoteScrollScraper:
 
         finally:
             driver.quit()
+            logger.debug("Dynamic scrape finished after %d scrolls", scroll_count)
 
         return list(quotes.values())
 
     @staticmethod
     def _parse_quote_div(div) -> dict:
-        """Convert one ``<div class="quote">`` block to a plain dict."""
+        """Convert one <div class="quote"> block to dict."""
         text = div.select_one("span.text").get_text(strip=True)
         author = div.select_one("small.author").get_text(strip=True)
         tags = [a.get_text(strip=True) for a in div.select("div.tags a.tag")]
         return {"text": text, "author": author, "tags": tags}
 
-
 def _cli() -> None:
-    """Parse command-line args and run the scraper."""
+    """Parse CLI args, configure logging, run scraper."""
     p = argparse.ArgumentParser(
         description="Scrape the infinite-scroll quotes demo into CSV/JSON."
     )
     p.add_argument("-o", "--out", type=Path, default="quotes.csv", help="Output file")
+    p.add_argument("--dynamic", action="store_true", help="Use Selenium scrolling")
+    p.add_argument("--rows", type=int, default=100, help="Min rows to collect")
     p.add_argument(
-        "--dynamic",
-        action="store_true",
-        help="Render JavaScript with Selenium (recommended).",
-    )
-    p.add_argument(
-        "--rows",
-        type=int,
-        default=100,
-        help="Minimum number of quotes to collect (default 100).",
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Console log level (default INFO)",
     )
     args = p.parse_args()
+
+    _configure_logging(args.log_level)
 
     scraper = QuoteScrollScraper(dynamic=args.dynamic, min_quotes=args.rows)
     df = scraper.scrape()
