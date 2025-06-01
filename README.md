@@ -1,4 +1,4 @@
-# QuoteScrollScraper – Take-Home Assessment
+# WebScraper – Take-Home Assessment
 
 Scrape the “infinite-scroll” demo at **<https://quotes.toscrape.com/scroll>** and
 export at least *N* quotes (default = 100) to CSV **or** JSON.
